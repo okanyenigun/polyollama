@@ -3,6 +3,7 @@ Async parallel inference across multiple Ollama servers.
 """
 
 import asyncio
+import math
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import BaseOutputParser
@@ -44,7 +45,7 @@ async def _async_inference(
 
 async def parallel_inference(
     extra_ports: List[int],
-    query: Dict[str, str],
+    query: Union[List[Dict[str, str]], List[str]],
     prompt: str,
     model: str,
     parser: Optional[BaseOutputParser] = None,
@@ -67,24 +68,39 @@ async def parallel_inference(
 
     prompt = PromptTemplate.from_template(prompt)
 
-    try:
-        urls = [None] + [srv.url for srv in servers]  # None → default server
+    total = len(query)
+    counter = [0]
+    urls = [None] + [srv.url for srv in servers]  # None → default server
+    # Limit in-flight requests to avoid overwhelming servers (one slot per server)
+    semaphore = asyncio.Semaphore(len(urls))
 
+    async def _tracked(item, url):
+        async with semaphore:
+            result = await _async_inference(
+                query=item,
+                prompt=prompt,
+                model=model,
+                parser=parser,
+                model_kwargs=model_kwargs,
+                base_url=url,
+            )
+        counter[0] += 1
+        if verbose and (counter[0] % 100 == 0 or counter[0] == total):
+            print(f"  Progress: {counter[0]}/{total} done")
+        return result
+
+    try:
         results = await asyncio.gather(
             *[
-                _async_inference(
-                    query=query,
-                    prompt=prompt,
-                    model=model,
-                    parser=parser,
-                    model_kwargs=model_kwargs,
-                    base_url=url,
-                )
-                for url in urls
+                _tracked(item, urls[i % len(urls)])
+                for i, item in enumerate(query)
             ]
         )
         if verbose:
             print("Inference complete.")
+    except Exception as e:
+        print(f"Error during inference: {e}")
+        raise
     finally:
         for srv in servers:
             srv.stop()
@@ -93,36 +109,41 @@ async def parallel_inference(
 
 
 async def _async_batch_on_server(
-    chunks: Union[List[List[Dict[str, str]]], List[List[str]]],
+    chunk: Union[List[Dict[str, str]], List[str]],
     prompt: PromptTemplate,
     model: str,
     parser: Optional[BaseOutputParser] = None,
     model_kwargs: Optional[Dict[str, Any]] = None,
     base_url: Optional[str] = None,
+    counter: Optional[List[int]] = None,
+    total: Optional[int] = None,
+    verbose: bool = False,
 ) -> Dict[str, Any]:
     """Run a batch of inference calls on a single server and return the responses along with the server URL."""
-    # Note: model_kwargs can include any ChatOllama init args except 'model' and 'base_url'
     kwargs = dict(model=model, **(model_kwargs or {}))
     if base_url:
         kwargs["base_url"] = base_url
 
     llm = ChatOllama(**kwargs)
-    # If a parser is provided, chain it after the LLM. Otherwise just prompt → LLM.
+    chain = prompt | llm | parser if parser else prompt | llm
+
     if parser:
-        chain = prompt | llm | parser
-    else:
-        chain = prompt | llm
+        fmt = parser.get_format_instructions()
+        for q in chunk:
+            if isinstance(q, dict):
+                q["format_instructions"] = fmt
 
-    # If the parser is used, we need to add format instructions to each query dict for the batch inference calls.
-    if parser:
-        format_instructions = parser.get_format_instructions()
-        for chunk in chunks:
-            for query in chunk:
-                query["format_instructions"] = format_instructions
+    all_responses = []
+    for i in range(0, len(chunk), 100):
+        sub = chunk[i : i + 100]
+        responses = await chain.abatch(sub)
+        all_responses.extend(responses)
+        if counter is not None:
+            counter[0] += len(responses)
+            if verbose:
+                print(f"  Progress: {counter[0]}/{total} done")
 
-    responses = await chain.abatch(chunks)
-
-    return {"responses": responses, "url": base_url or "default server"}
+    return {"responses": all_responses, "url": base_url or "default server"}
 
 
 async def parallel_batch_inference(
@@ -137,15 +158,11 @@ async def parallel_batch_inference(
     """Start one additional Ollama server per port in *extra_ports*, then run batch inference in parallel."""
     all_ports = [None] + extra_ports  # None → default server
     n_servers = len(all_ports)
-    # Split the query list into chunks for each server. The last chunk may be larger if the total number of queries isn't perfectly divisible by n_servers.
-    chunk_size = max(1, len(query_list) // n_servers)
+    # Split the query list into at most n_servers chunks.
+    chunk_size = math.ceil(len(query_list) / n_servers)
     chunks = [
         query_list[i : i + chunk_size] for i in range(0, len(query_list), chunk_size)
     ]
-
-    if len(chunks) > n_servers:
-        chunks[-2].extend(chunks[-1])
-        chunks = chunks[:-1]
 
     # Create OllamaServer instances for each extra port. The default server is assumed to be already running.
     servers = [OllamaServer(port=p) for p in extra_ports]
@@ -167,26 +184,39 @@ async def parallel_batch_inference(
     if verbose:
         print("All servers ready. Running batch inference...")
 
+    total = len(query_list)
+    counter = [0]
+
     try:
         urls = [None] + [srv.url for srv in servers]
         nested = await asyncio.gather(
             *[
                 _async_batch_on_server(
-                    chunks=chunk,
+                    chunk=chunk,
                     prompt=prompt,
                     model=model,
                     parser=parser,
                     model_kwargs=model_kwargs,
                     base_url=url,
+                    counter=counter,
+                    total=total,
+                    verbose=verbose,
                 )
-                for i, (url, chunk) in enumerate(zip(urls, chunks))
+                for url, chunk in zip(urls, chunks)
             ]
         )
         if verbose:
             print("Batch inference complete.")
+    except Exception as e:
+        print(f"Error during batch inference: {e}")
+        raise
     finally:
         for srv in servers:
             srv.stop()
 
     # Flatten while preserving per-server chunk order
-    return [item for chunk_results in nested for item in chunk_results]
+    return [
+        {"url": chunk_result["url"], "response": response}
+        for chunk_result in nested
+        for response in chunk_result["responses"]
+    ]

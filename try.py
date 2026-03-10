@@ -2,90 +2,93 @@ import asyncio
 import time
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import PromptTemplate
-from datasets import load_dataset
 from typing import Optional
 
 from polyollama import (
-    OllamaServer,
     parallel_inference,
-    sequential_inference,
-    batch_inference,
-    parallel_distributed_inference,
+    parallel_batch_inference,
     MPSContext,
 )
+from polyollama.misc.example_utils import load_question_dataset, simple_inference, sequential_inference, batch_inference
 
-
-def load(n: int):
-    ds = load_dataset("HiTruong/movie_QA", "default")
-    questions = [item["Question"] for item in ds["train_v1"]]
-    return questions[:n]
-
-def get_chain(model: str, base_url: Optional[str] = None):
-    prompt = PromptTemplate.from_template("Answer politely: {question}")
-    kwargs = dict(model=model, temperature=0, max_tokens=2048)
-
-    if base_url:
-        kwargs["base_url"] = base_url
-
-    model = ChatOllama(**kwargs)
-    chain = prompt | model
-    return chain
-
-def simple_inference(model:str, question: str, base_url: Optional[str] = None):
-    start = time.time()
-    chain = get_chain(model=model, base_url=base_url)
-    response = chain.invoke(question)
-    print(f"Time taken: {time.time() - start:.2f} seconds")
-    return response
 
 async def main():
-    print("Starting Testing...")
+    print("Starting QUESTION Benchmark Testing...")
 
-    n = 3000
-    model = "gemma2:2b"
-    questions = load(n=n)
+    N = 3000
+    BATCH_SIZE = 6
+    MODEL = "gemma2:2b"
+    MODEL_KWARGS = {"temperature": 0, "max_tokens": 2048}
+    N_PORTS = 5
+    EXTRA_PORTS = list(range(11435, 11435 + N_PORTS))
+    PROMPT_TEMPLATE = "Answer politely: {question}"
 
-    print("\n=== Simple inference (1 question) ===")
-    simple_inference(model=model, question=questions[0])
+    question_list = load_question_dataset(n=N)
 
-    # ------------------------------------------------------------------ #
-    # 1. Sequential: 300 questions, one by one on the default server
-    # ------------------------------------------------------------------ #
-    print("\n=== Sequential inference (300 questions) ===")
-    sequential_inference(model=model, questions=questions)
-
-    # ------------------------------------------------------------------ #
-    # 2. Batch: 300 questions in chunks of 6 on the default server
-    # ------------------------------------------------------------------ #
-    print("\n=== Batch inference (300 questions, batch_size=6) ===")
-    batch_inference(model=model, questions=questions, batch_size=6)
+    print("\n=== Smoke Simple inference (1 question) ===")
+    response = simple_inference(model=MODEL, question=question_list[0])
+    print(f"Response: {response.content[:20]}...")
 
     # ------------------------------------------------------------------ #
-    # 3. Parallel distributed: 300 questions split across 4 servers
-    #    Default (11434) + 11435 + 11436 + 11437  →  6 questions each
+    # 1. Sequential: one by one on the default server
     # ------------------------------------------------------------------ #
-    print("\n=== Parallel distributed inference (4 servers × 6 questions) ===")
-    await parallel_distributed_inference(
-        model=model,
-        questions=questions,
-        extra_ports=[11435, 11436, 11437, 11438, 11439],
+    print("\n=== Sequential inference ===")
+    responses = sequential_inference(model=MODEL, questions=question_list)
+    print(f"Total responses received: {len(responses)}\nLast response: {responses[-1]['response'].content[:20]}...")
+
+    # ------------------------------------------------------------------ #
+    # 2. Batch: in chunks on the default server
+    # ------------------------------------------------------------------ #
+    print("\n=== Batch inference ===")
+    responses = batch_inference(model=MODEL, questions=question_list, batch_size=BATCH_SIZE)
+    print(f"Total responses received: {len(responses)}\nLast response: {responses[-1]['response'].content[:20]}...")
+
+    # ------------------------------------------------------------------ #
+    # 3. Parallel: in chunks on multiple servers
+    # ------------------------------------------------------------------ #
+    start = time.time()
+    print("\n=== Parallel inference ===")
+    responses = await parallel_inference(extra_ports=EXTRA_PORTS, query=question_list, prompt=PROMPT_TEMPLATE, model=MODEL, model_kwargs=MODEL_KWARGS)
+    print(f"Total time taken for parallel inference: {time.time() - start:.2f} seconds")
+    print(f"Total responses received: {len(responses)}\nLast response: {responses[-1]['response'].content[:20]}...")
+
+    # ------------------------------------------------------------------ #
+    # 4. Parallel distributed: split across servers
+    # ------------------------------------------------------------------ #
+    print("\n=== Parallel distributed inference ===")
+    start = time.time()
+    responses = await parallel_batch_inference(
+        extra_ports=EXTRA_PORTS,
+        query_list=question_list,
+        prompt=PROMPT_TEMPLATE,
+        model=MODEL,
+        model_kwargs=MODEL_KWARGS,
     )
+    print(f"Total time taken for parallel distributed inference: {time.time() - start:.2f} seconds")
+    print(f"Total responses received: {len(responses)}\nLast response: {responses[-1]['response'].content[:20]}...")
 
     # ------------------------------------------------------------------ #
-    # 4. MPS parallel distributed: same 4 servers, but GPU SMs are shared
+    # 5. MPS parallel distributed: same servers, but GPU SMs are shared
     #    concurrently via the NVIDIA MPS daemon — should be faster than
     #    the plain parallel run above on a single GPU.
     # ------------------------------------------------------------------ #
     print("\n=== MPS parallel distributed inference (4 servers × 6 questions) ===")
+    start = time.time()
     with MPSContext(gpu_id=0) as mps:
-        await parallel_distributed_inference(
-            model=model,
-            questions=questions,
-            extra_ports=[11435, 11436, 11437, 11438, 11439],
+        responses = await parallel_batch_inference(
+            extra_ports=EXTRA_PORTS,
+            query_list=question_list,
+            prompt=PROMPT_TEMPLATE,
+            model=MODEL,
+            model_kwargs=MODEL_KWARGS,
         )
-
+    print(f"Total time taken for MPS parallel distributed inference: {time.time() - start:.2f} seconds")
+    print(f"Total responses received: {len(responses)}\nLast response: {responses[-1]['response'].content[:20]}...")
+    
+    print("\n=== Smoke Simple inference (1 question) ===")
+    simple_inference(model=MODEL, question=question_list[0])
+    
     print("\nTesting complete.")
-    simple_inference(model=model, question=questions[0])
 
 if __name__ == "__main__":
     asyncio.run(main())
