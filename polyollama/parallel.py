@@ -135,6 +135,7 @@ async def _async_batch_on_server(
 
     all_responses = []
     for i in range(0, len(chunk), 100):
+        # Process the batch in sub-chunks to avoid overwhelming the server. Adjust the sub-chunk size as needed.
         sub = chunk[i : i + 100]
         responses = await chain.abatch(sub)
         all_responses.extend(responses)

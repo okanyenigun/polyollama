@@ -1,18 +1,23 @@
 import time
 from typing import Optional, Dict, Any, List
 
+
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 11434
 DEFAULT_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
 
+
 def load_question_dataset(n: int) -> List[str]:
+    """Load a dataset of questions to use for testing."""
     from datasets import load_dataset
 
     ds = load_dataset("HiTruong/movie_QA", "default")
     questions = [item["Question"] for item in ds["train_v1"]]
     return questions[:n]
 
+
 def get_chain(model: str, base_url: Optional[str] = None) -> Any:
+    """Helper to create a LangChain chain for the specified model and base_url."""
     from langchain_core.prompts import PromptTemplate
     from langchain_ollama import ChatOllama
 
@@ -28,6 +33,7 @@ def get_chain(model: str, base_url: Optional[str] = None) -> Any:
 
 
 def simple_inference(model:str, question: str, base_url: Optional[str] = None) -> Any:
+    """Run a single inference using the specified model and question."""
     start = time.time()
 
     chain = get_chain(model=model, base_url=base_url)
