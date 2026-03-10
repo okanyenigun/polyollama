@@ -3,72 +3,88 @@ Async parallel inference across multiple Ollama servers.
 """
 
 import asyncio
-import time
-from typing import Optional
-
 from langchain_ollama import ChatOllama
 from langchain_core.prompts import PromptTemplate
-
-from .server import OllamaServer, DEFAULT_URL
+from langchain_core.output_parsers import BaseOutputParser
+from typing import List, Dict, Any, Optional, Union
+from .server import OllamaServer
 
 
 async def _async_inference(
+    query: Dict[str, str],
+    prompt: PromptTemplate,
     model: str,
-    question: str,
+    parser: Optional[BaseOutputParser] = None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
     base_url: Optional[str] = None,
-) -> dict:
+) -> Dict[str, Any]:
     """Run a single async inference call and return a result dict."""
-    prompt = PromptTemplate.from_template("Answer politely: {question}")
-    kwargs: dict = dict(model=model, temperature=0, max_tokens=2048)
+    # Note: model_kwargs can include any ChatOllama init args except 'model' and 'base_url'
+    kwargs = dict(model=model, **(model_kwargs or {}))
     if base_url:
         kwargs["base_url"] = base_url
 
     llm = ChatOllama(**kwargs)
-    chain = prompt | llm
+    # If a parser is provided, chain it after the LLM. Otherwise just prompt → LLM.
+    if parser:
+        chain = prompt | llm | parser
+    else:
+        chain = prompt | llm
+    # If the parser is used, we need to add format instructions to the query dict for each inference call.
+    if parser:
+        format_instructions = parser.get_format_instructions()
+        query["format_instructions"] = format_instructions
 
-    start = time.time()
-    response = await chain.ainvoke({"question": question})
-    elapsed = time.time() - start
+    response = await chain.ainvoke(query)
 
-    url = base_url or DEFAULT_URL
-    print(f"[{url}] Time taken: {elapsed:.2f}s")
-    return {"url": url, "response": response, "elapsed": elapsed}
+    url = base_url or "default server"
+
+    return {"url": url, "response": response}
 
 
 async def parallel_inference(
+    extra_ports: List[int],
+    query: Dict[str, str],
+    prompt: str,
     model: str,
-    question: str,
-    extra_ports: list[int],
-) -> list[dict]:
-    """
-    Start one additional Ollama server per port in *extra_ports*, then run
-    *question* against all of them **and** the default server simultaneously.
-
-    The default server (port 11434) is assumed to be already running.
-    Extra servers are started concurrently, queried in parallel, then stopped.
-
-    Returns a list of result dicts: {url, response, elapsed}.
-    """
+    parser: Optional[BaseOutputParser] = None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
+    verbose: bool = True,
+) -> List[Dict[str, Any]]:
+    """Start one additional Ollama server per port in *extra_ports*, then run inference in parallel."""
+    # Create OllamaServer instances for each extra port. The default server is assumed to be already running.
     servers = [OllamaServer(port=port) for port in extra_ports]
-
-    print(f"Starting {len(servers)} extra server(s)...")
-    wall_start = time.time()
-
+    if verbose:
+        print(f"Starting {len(servers)} extra server(s)...")
     # Boot all extra servers concurrently (blocking start() pushed to threads)
     await asyncio.gather(*[asyncio.to_thread(srv.start) for srv in servers])
-    print(f"All servers ready in {time.time() - wall_start:.2f}s. Running inference...")
+    if verbose:
+        print("All servers ready. Running inference...")
+    # If a parser is provided, ensure the prompt includes format instructions.
+    if parser:
+        if "{format_instructions}" not in prompt:
+            prompt += "\n\nFormat Instructions:\n{format_instructions}"
+
+    prompt = PromptTemplate.from_template(prompt)
 
     try:
         urls = [None] + [srv.url for srv in servers]  # None → default server
-        inference_start = time.time()
+
         results = await asyncio.gather(
             *[
-                _async_inference(model=model, question=question, base_url=url)
+                _async_inference(
+                    query=query,
+                    prompt=prompt,
+                    model=model,
+                    parser=parser,
+                    model_kwargs=model_kwargs,
+                    base_url=url,
+                )
                 for url in urls
             ]
         )
-        total_elapsed = time.time() - inference_start
-        print(f"Total parallel inference time: {total_elapsed:.2f}s")
+        if verbose:
+            print("Inference complete.")
     finally:
         for srv in servers:
             srv.stop()
@@ -76,173 +92,98 @@ async def parallel_inference(
     return list(results)
 
 
-# ---------------------------------------------------------------------------
-# Sequential inference over n questions
-# ---------------------------------------------------------------------------
-
-def sequential_inference(
-    model: str,
-    questions: list[str],
-    base_url: Optional[str] = None,
-) -> list[dict]:
-    """
-    Run *questions* one by one against a single server and return results.
-    Prints per-question and total elapsed time.
-    """
-    from langchain_ollama import ChatOllama  # local import to keep top-level clean
-
-    prompt = PromptTemplate.from_template("Answer politely: {question}")
-    kwargs: dict = dict(model=model, temperature=0, max_tokens=2048)
-    if base_url:
-        kwargs["base_url"] = base_url
-
-    llm = ChatOllama(**kwargs)
-    chain = prompt | llm
-
-    url = base_url or DEFAULT_URL
-    results = []
-    total_start = time.time()
-
-    for i, question in enumerate(questions):
-        start = time.time()
-        response = chain.invoke({"question": question})
-        elapsed = time.time() - start
-        if i % 100 == 0:
-            print(f"[{url}] Q{i+1}/{len(questions)} done in {elapsed:.2f}s")
-        results.append({"url": url, "question": question, "response": response, "elapsed": elapsed})
-
-    total_elapsed = time.time() - total_start
-    print(f"Sequential total: {total_elapsed:.2f}s for {len(questions)} questions")
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Batch inference (LangChain .batch()) over n questions
-# ---------------------------------------------------------------------------
-
-def batch_inference(
-    model: str,
-    questions: list[str],
-    batch_size: int = 6,
-    base_url: Optional[str] = None,
-) -> list[dict]:
-    """
-    Run *questions* through a single server using LangChain's `.batch()`,
-    chunked into groups of *batch_size*. Prints per-batch and total time.
-    """
-    prompt = PromptTemplate.from_template("Answer politely: {question}")
-    kwargs: dict = dict(model=model, temperature=0, max_tokens=2048)
-    if base_url:
-        kwargs["base_url"] = base_url
-
-    llm = ChatOllama(**kwargs)
-    chain = prompt | llm
-
-    url = base_url or DEFAULT_URL
-    results = []
-    total_start = time.time()
-    batches = [questions[i : i + batch_size] for i in range(0, len(questions), batch_size)]
-
-    for b_idx, batch in enumerate(batches):
-        inputs = [{"question": q} for q in batch]
-        start = time.time()
-        responses = chain.batch(inputs)
-        elapsed = time.time() - start
-        if b_idx % 10 == 0:
-            print(
-                f"[{url}] Batch {b_idx+1}/{len(batches)} "
-                f"({len(batch)} examples) done in {elapsed:.2f}s"
-            )
-        for question, response in zip(batch, responses):
-            results.append({"url": url, "question": question, "response": response})
-
-    total_elapsed = time.time() - total_start
-    print(f"Batch total: {total_elapsed:.2f}s for {len(questions)} questions (batch_size={batch_size})")
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Parallel distributed inference across multiple servers
-# ---------------------------------------------------------------------------
-
 async def _async_batch_on_server(
+    chunks: Union[List[List[Dict[str, str]]], List[List[str]]],
+    prompt: PromptTemplate,
     model: str,
-    questions: list[str],
-    base_url: Optional[str],
-    server_idx: int,
-    total_servers: int,
-) -> list[dict]:
-    """Run a chunk of questions on one server using async .abatch()."""
-    prompt = PromptTemplate.from_template("Answer politely: {question}")
-    kwargs: dict = dict(model=model, temperature=0, max_tokens=2048)
+    parser: Optional[BaseOutputParser] = None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
+    base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run a batch of inference calls on a single server and return the responses along with the server URL."""
+    # Note: model_kwargs can include any ChatOllama init args except 'model' and 'base_url'
+    kwargs = dict(model=model, **(model_kwargs or {}))
     if base_url:
         kwargs["base_url"] = base_url
 
     llm = ChatOllama(**kwargs)
-    chain = prompt | llm
+    # If a parser is provided, chain it after the LLM. Otherwise just prompt → LLM.
+    if parser:
+        chain = prompt | llm | parser
+    else:
+        chain = prompt | llm
 
-    url = base_url or DEFAULT_URL
-    inputs = [{"question": q} for q in questions]
+    # If the parser is used, we need to add format instructions to each query dict for the batch inference calls.
+    if parser:
+        format_instructions = parser.get_format_instructions()
+        for chunk in chunks:
+            for query in chunk:
+                query["format_instructions"] = format_instructions
 
-    start = time.time()
-    responses = await chain.abatch(inputs)
-    elapsed = time.time() - start
-    print(
-        f"[{url}] Server {server_idx+1}/{total_servers}: "
-        f"{len(questions)} questions done in {elapsed:.2f}s"
-    )
-    return [
-        {"url": url, "question": q, "response": r, "elapsed": elapsed}
-        for q, r in zip(questions, responses)
-    ]
+    responses = await chain.abatch(chunks)
+
+    return {"responses": responses, "url": base_url or "default server"}
 
 
-async def parallel_distributed_inference(
-    model: str,
-    questions: list[str],
+async def parallel_batch_inference(
     extra_ports: list[int],
-) -> list[dict]:
-    """
-    Distribute *questions* evenly across the default server + one server per
-    port in *extra_ports*, running all servers concurrently with .abatch().
-
-    Example: 24 questions across 4 servers → 6 questions per server.
-
-    Returns a flat list of result dicts preserving original question order.
-    """
+    query_list: List[Dict[str, str]],
+    prompt: str,
+    model: str,
+    parser: Optional[BaseOutputParser] = None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
+    verbose: bool = True,
+):
+    """Start one additional Ollama server per port in *extra_ports*, then run batch inference in parallel."""
     all_ports = [None] + extra_ports  # None → default server
     n_servers = len(all_ports)
-    chunk_size = max(1, len(questions) // n_servers)
-    chunks = [questions[i : i + chunk_size] for i in range(0, len(questions), chunk_size)]
-    # Handle remainder by folding into last chunk
+    # Split the query list into chunks for each server. The last chunk may be larger if the total number of queries isn't perfectly divisible by n_servers.
+    chunk_size = max(1, len(query_list) // n_servers)
+    chunks = [
+        query_list[i : i + chunk_size] for i in range(0, len(query_list), chunk_size)
+    ]
+
     if len(chunks) > n_servers:
         chunks[-2].extend(chunks[-1])
         chunks = chunks[:-1]
 
+    # Create OllamaServer instances for each extra port. The default server is assumed to be already running.
     servers = [OllamaServer(port=p) for p in extra_ports]
 
-    print(f"Starting {len(servers)} extra server(s)...")
-    wall_start = time.time()
+    if verbose:
+        print(
+            f"Starting {len(servers)} extra server(s), with {len(chunks)} chunk(s) of queries..."
+        )
+
+    if parser:
+        if "{format_instructions}" not in prompt:
+            prompt += "\n\nFormat Instructions:\n{format_instructions}"
+
+    prompt = PromptTemplate.from_template(prompt)
+
+    # Boot all extra servers concurrently (blocking start() pushed to threads)
     await asyncio.gather(*[asyncio.to_thread(srv.start) for srv in servers])
-    print(f"All servers ready in {time.time() - wall_start:.2f}s. Distributing {len(questions)} questions across {n_servers} servers...")
+
+    if verbose:
+        print("All servers ready. Running batch inference...")
 
     try:
         urls = [None] + [srv.url for srv in servers]
-        inference_start = time.time()
         nested = await asyncio.gather(
             *[
                 _async_batch_on_server(
+                    chunks=chunk,
+                    prompt=prompt,
                     model=model,
-                    questions=chunk,
+                    parser=parser,
+                    model_kwargs=model_kwargs,
                     base_url=url,
-                    server_idx=i,
-                    total_servers=n_servers,
                 )
                 for i, (url, chunk) in enumerate(zip(urls, chunks))
             ]
         )
-        total_elapsed = time.time() - inference_start
-        print(f"Total parallel distributed inference time: {total_elapsed:.2f}s")
+        if verbose:
+            print("Batch inference complete.")
     finally:
         for srv in servers:
             srv.stop()

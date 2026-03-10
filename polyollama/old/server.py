@@ -18,11 +18,18 @@ Usage
 """
 
 import os
-import time
 import subprocess
+import time
 import urllib.request
 import urllib.error
 from typing import Optional
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 11434
+DEFAULT_URL = f"http://{DEFAULT_HOST}:{DEFAULT_PORT}"
+
+_STARTUP_TIMEOUT = 30   # seconds to wait for a server to become ready
+_POLL_INTERVAL  = 0.5   # seconds between readiness checks
 
 
 class OllamaServer:
@@ -31,25 +38,13 @@ class OllamaServer:
     def __init__(
         self,
         port: int,
-        host: str = "127.0.0.1",
-        startup_timeout: float = 30,
-        poll_interval: float = 0.5,
-    ):
+        host: str = DEFAULT_HOST,
+        startup_timeout: float = _STARTUP_TIMEOUT,
+    ) -> None:
         self.host = host
         self.port = port
         self.startup_timeout = startup_timeout
-        self.poll_interval = poll_interval
         self._process: Optional[subprocess.Popen] = None
-
-    # ------------------------------------------------------------------
-    # Context-manager protocol
-    # ------------------------------------------------------------------
-
-    def __enter__(self) -> "OllamaServer":
-        return self.start()
-
-    def __exit__(self, *_) -> None:
-        self.stop()
 
     # ------------------------------------------------------------------
     # Properties
@@ -62,7 +57,6 @@ class OllamaServer:
 
     @property
     def is_running(self) -> bool:
-        """True if the server process is currently running."""
         return self._process is not None and self._process.poll() is None
 
     # ------------------------------------------------------------------
@@ -74,11 +68,9 @@ class OllamaServer:
         if self.is_running:
             return self
 
-        # Set OLLAMA_HOST to ensure the server listens on the correct port
         env = os.environ.copy()
         env["OLLAMA_HOST"] = f"{self.host}:{self.port}"
 
-        # Start the Ollama server process
         self._process = subprocess.Popen(
             ["ollama", "serve"],
             env=env,
@@ -93,43 +85,51 @@ class OllamaServer:
         """Terminate the Ollama server process."""
         if self._process is not None:
             self._process.terminate()
-            # Wait for the process to exit, with a timeout to avoid hanging
             try:
                 self._process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 self._process.kill()
             self._process = None
-        return
+
+    # ------------------------------------------------------------------
+    # Context-manager protocol
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> "OllamaServer":
+        return self.start()
+
+    def __exit__(self, *_) -> None:
+        self.stop()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _wait_until_ready(self) -> None:
-        """Poll the server until it responds or the process exits, up to the startup timeout."""
         deadline = time.time() + self.startup_timeout
-        # Poll the server until it responds or the process exits
         while time.time() < deadline:
-            # Check if the process has exited unexpectedly
             if self._process.poll() is not None:
                 raise RuntimeError(
-                    f"Ollama process on port {self.port} terminated unexpectedly."
+                    f"Ollama process on port {self.port} exited unexpectedly."
                 )
-            # Try to connect to the server's API endpoint
             try:
-                with urllib.request.urlopen(f"{self.url}/api/tags", timeout=2):
-                    return  # Server is ready
+                with urllib.request.urlopen(
+                    f"{self.url}/api/tags", timeout=2
+                ):
+                    return   # server responded → ready
             except (urllib.error.URLError, OSError):
-                time.sleep(self.poll_interval)
+                time.sleep(_POLL_INTERVAL)
 
         raise TimeoutError(
-            f"Ollama server on port {self.port} did not become ready within {self.startup_timeout} seconds."
+            f"Ollama server on port {self.port} did not become ready "
+            f"within {self.startup_timeout} seconds."
         )
 
-    # ------------------------------------------------------------------
-    # External helpers
-    # ------------------------------------------------------------------
-    @staticmethod
-    def server_url(port: int, host: str = "127.0.0.1") -> str:
-        """Construct the base URL for a server on the given host and port."""
-        return f"http://{host}:{port}"
+
+# ---------------------------------------------------------------------------
+# Convenience helpers
+# ---------------------------------------------------------------------------
+
+def server_url(port: int, host: str = DEFAULT_HOST) -> str:
+    """Return the base URL for an already-running Ollama server on *port*."""
+    return f"http://{host}:{port}"

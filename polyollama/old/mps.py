@@ -28,36 +28,50 @@ Quickstart
 """
 
 import os
-import time
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
+_DEFAULT_PIPE_DIR = "/tmp/nvidia-mps"
+_DEFAULT_LOG_DIR  = "/tmp/nvidia-mps-log"
+
 
 class MPSContext:
+    """
+    Start the NVIDIA MPS control daemon on *gpu_id* and set the required
+    environment variables so that every child process (Ollama server) that
+    is spawned while this context is active automatically uses MPS.
+
+    Parameters
+    ----------
+    gpu_id : int
+        Index of the GPU to use (``CUDA_VISIBLE_DEVICES``).
+    pipe_dir : str
+        Directory for the MPS Unix-domain socket.  Defaults to
+        ``/tmp/nvidia-mps``.
+    log_dir : str
+        Directory where the MPS daemon writes logs.  Defaults to
+        ``/tmp/nvidia-mps-log``.
+    thread_percentage : int | None
+        ``CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`` — how many SMs each MPS
+        client may use (1–100).  Leave ``None`` to use the driver default
+        (100 %, all SMs shared among clients).
+    """
+
     def __init__(
         self,
         gpu_id: int = 0,
-        pipe_dir: str = "/tmp/nvidia-mps",
-        log_dir: str = "/tmp/nvidia-mps-log",
+        pipe_dir: str = _DEFAULT_PIPE_DIR,
+        log_dir: str = _DEFAULT_LOG_DIR,
         thread_percentage: Optional[int] = None,
-    ):
+    ) -> None:
         self.gpu_id = gpu_id
         self.pipe_dir = pipe_dir
         self.log_dir = log_dir
         self.thread_percentage = thread_percentage
-        self._daemon_started: bool = False
-
-    # ------------------------------------------------------------------
-    # Context-manager protocol
-    # ------------------------------------------------------------------
-
-    def __enter__(self) -> "MPSContext":
-        return self.start()
-
-    def __exit__(self, *_) -> None:
-        self.stop()
+        self._daemon_started = False
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -76,15 +90,13 @@ class MPSContext:
             self._inject_env()
             return self
 
-        # Ensure the pipe and log directories exist before starting the daemon
         Path(self.pipe_dir).mkdir(parents=True, exist_ok=True)
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
 
-        # Start the MPS daemon with the appropriate environment variables
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        env["CUDA_VISIBLE_DEVICES"]    = str(self.gpu_id)
         env["CUDA_MPS_PIPE_DIRECTORY"] = self.pipe_dir
-        env["CUDA_MPS_LOG_DIRECTORY"] = self.log_dir
+        env["CUDA_MPS_LOG_DIRECTORY"]  = self.log_dir
         if self.thread_percentage is not None:
             env["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(self.thread_percentage)
 
@@ -94,7 +106,6 @@ class MPSContext:
             capture_output=True,
             text=True,
         )
-
         if result.returncode != 0:
             raise RuntimeError(
                 f"Failed to start MPS daemon: {result.stderr.strip() or result.stdout.strip()}"
@@ -104,13 +115,8 @@ class MPSContext:
         time.sleep(1.0)
 
         self._daemon_started = True
-
         self._inject_env()
-        pct = (
-            f", thread_percentage={self.thread_percentage}%"
-            if self.thread_percentage
-            else ""
-        )
+        pct = f", thread_percentage={self.thread_percentage}%" if self.thread_percentage else ""
         print(f"MPS daemon started (GPU {self.gpu_id}{pct})")
         return self
 
@@ -133,40 +139,39 @@ class MPSContext:
         self._daemon_started = False
         self._cleanup_env()
         print("MPS daemon stopped.")
-        return
+
+    # ------------------------------------------------------------------
+    # Context-manager protocol
+    # ------------------------------------------------------------------
+
+    def __enter__(self) -> "MPSContext":
+        return self.start()
+
+    def __exit__(self, *_) -> None:
+        self.stop()
 
     # ------------------------------------------------------------------
     # Static helpers
     # ------------------------------------------------------------------
+
     @staticmethod
     def is_available() -> bool:
-        """True if the MPS control daemon executable is available."""
+        """Return True if ``nvidia-cuda-mps-control`` is in PATH."""
         return shutil.which("nvidia-cuda-mps-control") is not None
 
     @staticmethod
-    def is_running(pipe_dir: str = "/tmp/nvidia-mps") -> bool:
-        """True if the MPS daemon is currently running (i.e. socket exists and is responsive)."""
+    def is_running(pipe_dir: str = _DEFAULT_PIPE_DIR) -> bool:
+        """Probe an existing MPS daemon by sending a no-op command."""
         env = os.environ.copy()
         env["CUDA_MPS_PIPE_DIRECTORY"] = pipe_dir
         result = subprocess.run(
             ["nvidia-cuda-mps-control"],
-            input="get_defeault_active_thread_percentage\n",
+            input="get_default_active_thread_percentage\n",
             env=env,
             capture_output=True,
             text=True,
         )
         return result.returncode == 0
-
-    @staticmethod
-    def _cleanup_env() -> None:
-        """Remove MPS-related env vars from the current process."""
-        for key in (
-            "CUDA_MPS_PIPE_DIRECTORY",
-            "CUDA_MPS_LOG_DIRECTORY",
-            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
-        ):
-            os.environ.pop(key, None)
-        return
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -174,11 +179,17 @@ class MPSContext:
 
     def _inject_env(self) -> None:
         """Set MPS env vars on the current process so children inherit them."""
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(self.gpu_id)
+        os.environ["CUDA_VISIBLE_DEVICES"]    = str(self.gpu_id)
         os.environ["CUDA_MPS_PIPE_DIRECTORY"] = self.pipe_dir
-        os.environ["CUDA_MPS_LOG_DIRECTORY"] = self.log_dir
+        os.environ["CUDA_MPS_LOG_DIRECTORY"]  = self.log_dir
         if self.thread_percentage is not None:
-            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(
-                self.thread_percentage
-            )
-        return
+            os.environ["CUDA_MPS_ACTIVE_THREAD_PERCENTAGE"] = str(self.thread_percentage)
+
+    @staticmethod
+    def _cleanup_env() -> None:
+        for key in (
+            "CUDA_MPS_PIPE_DIRECTORY",
+            "CUDA_MPS_LOG_DIRECTORY",
+            "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE",
+        ):
+            os.environ.pop(key, None)
