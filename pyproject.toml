@@ -1,9 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
 [project]
 name = "polyollama"
 version = "0.2.0"
 description = "Manage multiple Ollama servers and fan out parallel inference across them."
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.12"
+keywords = ["ollama", "llm", "parallel", "inference", "langchain"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = []   # core has no required dependencies
 
 [project.optional-dependencies]
@@ -16,3 +31,7 @@ all = [
     "datasets>=4.7.0",
     "ipywidgets>=8.1.8",
 ]
+
+[project.urls]
+Homepage = "https://github.com/okanyenigun/polyollama"
+Repository = "https://github.com/okanyenigun/polyollama"
