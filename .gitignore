@@ -10,4 +10,4 @@ wheels/
 .venv
 docs
 try.py
-uv.lockuv.lock
+uv.lock
