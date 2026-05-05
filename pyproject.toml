@@ -1,12 +1,18 @@
 [project]
-name = "pp"
-version = "0.1.0"
-description = "Add your description here"
+name = "polyollama"
+version = "0.2.0"
+description = "Manage multiple Ollama servers and fan out parallel inference across them."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = [
-    "datasets>=4.7.0",
-    "ipywidgets>=8.1.8",
+dependencies = []   # core has no required dependencies
+
+[project.optional-dependencies]
+inference = [
     "langchain>=1.2.10",
     "langchain-ollama>=1.0.1",
+]
+all = [
+    "polyollama[inference]",
+    "datasets>=4.7.0",
+    "ipywidgets>=8.1.8",
 ]

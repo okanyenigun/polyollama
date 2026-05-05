@@ -34,11 +34,15 @@ class OllamaServer:
         host: str = "127.0.0.1",
         startup_timeout: float = 30,
         poll_interval: float = 0.5,
+        num_parallel: int = 1,
+        num_ctx: Optional[int] = None,
     ):
         self.host = host
         self.port = port
         self.startup_timeout = startup_timeout
         self.poll_interval = poll_interval
+        self.num_parallel = num_parallel
+        self.num_ctx = num_ctx
         self._process: Optional[subprocess.Popen] = None
 
     # ------------------------------------------------------------------
@@ -77,6 +81,7 @@ class OllamaServer:
         # Set OLLAMA_HOST to ensure the server listens on the correct port
         env = os.environ.copy()
         env["OLLAMA_HOST"] = f"{self.host}:{self.port}"
+        env["OLLAMA_NUM_PARALLEL"] = str(self.num_parallel)
 
         # Start the Ollama server process
         self._process = subprocess.Popen(
